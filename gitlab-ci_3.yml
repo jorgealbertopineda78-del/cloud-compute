@@ -1,0 +1,91 @@
+# ============================================================
+# .gitlab-ci.yml — Pipeline CI/CD (GitLab CI)
+# Corre en el GitLab Runner instalado en la VM de Azure (Docker).
+# Registry: GitLab Container Registry (SIN JFrog).
+# Flujo: test -> sast -> quality(sonar) -> build+push -> deploy(docker)
+#
+# NOTA: el runner está registrado con el socket de Docker montado
+# (/var/run/docker.sock), así que los jobs con "image: docker:24"
+# ejecutan docker CONTRA el daemon de la VM. Por eso el contenedor
+# del deploy queda corriendo en la VM y NO necesitamos docker-in-docker.
+# ============================================================
+
+stages:
+  - test
+  - sast
+  - quality
+  - build
+  - deploy
+
+variables:
+  # CI_REGISTRY_IMAGE lo da GitLab solo: registry.gitlab.com/<grupo>/<proyecto>
+  IMAGE: "$CI_REGISTRY_IMAGE/agente"
+  # Versión única por pipeline (CI_PIPELINE_IID = consecutivo del proyecto)
+  VERSION: "1.0.$CI_PIPELINE_IID"
+
+# ---------- 1) Pruebas + cobertura ----------
+test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir -r requirements.txt pytest pytest-cov
+    - python -m pytest --cov=agent --cov-report=xml:coverage.xml --junitxml=report.xml
+  artifacts:
+    paths: [coverage.xml]        # la cobertura la usa Sonar después
+    reports:
+      junit: report.xml          # GitLab muestra los resultados de test
+
+# ---------- 2) SAST con Bandit (seguridad del código) ----------
+sast:
+  stage: sast
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir bandit
+    - bandit -r agent/ -f json -o bandit-report.json || true   # informativo (no frena)
+    - bandit -r agent/ || true                                 # versión legible en consola
+  artifacts:
+    paths: [bandit-report.json]  # lo importa Sonar
+
+# ---------- 3) Calidad con SonarQube ----------
+# Requiere un SonarQube accesible (contenedor en la VM o SonarCloud) y
+# las variables SONAR_HOST_URL y SONAR_TOKEN en CI/CD > Variables.
+sonarqube:
+  stage: quality
+  image: sonarsource/sonar-scanner-cli:latest
+  script:
+    - sonar-scanner
+        -Dsonar.projectKey=agente
+        -Dsonar.sources=.
+        -Dsonar.host.url=$SONAR_HOST_URL
+        -Dsonar.token=$SONAR_TOKEN
+        -Dsonar.python.coverage.reportPaths=coverage.xml
+        -Dsonar.python.bandit.reportPaths=bandit-report.json
+  allow_failure: true            # informativo: si Sonar falla, el pipeline sigue
+
+# ---------- 4) Build + Push a GitLab Container Registry ----------
+build:
+  stage: build
+  image: docker:24
+  script:
+    # Login al registry de GitLab -> credenciales AUTOMÁTICAS (no configuras nada)
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+    - docker push "$IMAGE:$VERSION"
+    - docker push "$IMAGE:latest"
+
+# ---------- 5) Deploy en Docker (en la misma VM) ----------
+deploy:
+  stage: deploy
+  image: docker:24
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker pull "$IMAGE:$VERSION"
+    - docker rm -f agente || true                    # quita el contenedor viejo si existe
+    - docker run -d --name agente --restart unless-stopped -p 9000:9000 "$IMAGE:$VERSION"
+    # verificación rápida (health check)
+    - sleep 5
+    - docker ps --filter "name=agente"
+  environment:
+    name: produccion
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'              # deploy SOLO desde main
